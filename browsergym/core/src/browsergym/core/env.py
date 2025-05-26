@@ -54,6 +54,7 @@ class BrowserEnv(gym.Env, ABC):
 
     # gym metadata
     metadata = {"render_modes": None}
+    stealth_js_script = None
 
     def __init__(
         self,
@@ -225,6 +226,13 @@ class BrowserEnv(gym.Env, ABC):
             **self.pw_chromium_kwargs,
         )
 
+        if self.stealth_js_script is None:
+            try:
+                with open(Path(__file__).parent / "javascript/stealth.min.js", "r") as f:
+                    self.stealth_js_script = f.read()
+            except FileNotFoundError:
+                raise FileNotFoundError("stealth.min.js not found. Please check the file path.")
+
         # create a new browser context for pages
         self.context = self.browser.new_context(
             no_viewport=True if self.resizeable_window else None,
@@ -233,9 +241,12 @@ class BrowserEnv(gym.Env, ABC):
                 Path(self.record_video_dir) / "task_video" if self.record_video_dir else None
             ),
             record_video_size=viewport,
+            ignore_https_errors=True,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36", # 示例UA
             # will raise an Exception if above args are overriden
             **self.pw_context_kwargs,
         )
+        self.context.add_init_script(self.stealth_js_script)
 
         # set default timeout
         self.context.set_default_timeout(timeout)

@@ -31,6 +31,7 @@ class Chat:
             no_viewport=True,
             record_video_dir=Path(record_video_dir) / "chat_video" if record_video_dir else None,
             record_video_size=dict(width=chat_size[0], height=chat_size[1]),
+            ignore_https_errors=True,
         )
         self.page = self.context.new_page()
         self.recording_start_time = time.time() if record_video_dir else None
