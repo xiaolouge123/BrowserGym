@@ -5,6 +5,14 @@ import time
 from abc import ABC
 from pathlib import Path
 from typing import Literal, Optional
+import hashlib
+import json
+import base64
+
+try:
+    import redis
+except ImportError:
+    redis = None
 
 import gymnasium as gym
 import numpy as np
@@ -75,6 +83,8 @@ class BrowserEnv(gym.Env, ABC):
         pw_context_kwargs: dict = {},
         # agent-related arguments
         action_mapping: Optional[callable] = HighLevelActionSet().to_python_code,
+        enable_context_cache: bool = False,
+        context_cache_kwargs: dict = {},
     ):
         """
         Instantiate a ready to use BrowserEnv gym environment.
@@ -93,7 +103,8 @@ class BrowserEnv(gym.Env, ABC):
             pw_chromium_kwargs: extra parameters for the playwright Browser. Should only be used for debugging/testing.
             pw_context_kwargs: extra parameters for the playwright BrowserContext. Should only be used for debugging/testing.
             action_mapping: if set, the environment will use this function to map every received action to executable Python code.
-
+            enable_context_cache: if set, the environment will use redis to cache network requests.
+            context_cache_kwargs: additional arguments for redis caching.
         """
         super().__init__()
         self.task_entrypoint = task_entrypoint
@@ -110,9 +121,25 @@ class BrowserEnv(gym.Env, ABC):
         self.pw_chromium_kwargs = pw_chromium_kwargs
         self.pw_context_kwargs = pw_context_kwargs
         self.action_mapping = action_mapping
+        self.enable_context_cache = enable_context_cache
+        self.context_cache_kwargs = context_cache_kwargs
 
         # check argument values
         assert tags_to_mark in ("all", "standard_html")
+
+        # caching
+        self.redis_client = None
+        self.browser_cache_hit_stats = {}
+        if self.enable_context_cache:
+            if redis is None:
+                raise ImportError(
+                    "redis package not installed. Please install it with `pip install redis`"
+                )
+            redis_url = self.context_cache_kwargs.get("redis_url", "redis://localhost:6379/0")
+            self.redis_client = redis.from_url(
+                redis_url, encoding="utf-8", decode_responses=True
+            )
+            self.cache_ttl = self.context_cache_kwargs.get("ttl", 3600)
 
         # task
         self.task = None
@@ -166,6 +193,32 @@ class BrowserEnv(gym.Env, ABC):
         # action space
         self.action_space = Unicode(min_length=0, max_length=TEXT_MAX_LENGTH)
 
+        # 设置可缓存的资源类型
+        self.cacheable_resource_types = self.context_cache_kwargs.get(
+            'cacheable_resource_types', 
+            ["document", "stylesheet", "image", "font", "script"]
+        )
+        
+        # 页面快照功能配置
+        self.enable_page_snapshot = self.context_cache_kwargs.get('enable_page_snapshot', False)
+        self.snapshot_wait_time = self.context_cache_kwargs.get('snapshot_wait_time', 5000)  # ms
+        if self.enable_page_snapshot:
+            # 如果开启页面快照，则需要确保缓存xhr和fetch请。虽然快照模式缓存了最完整的document内容，但还是会请求动态内容。
+            if "xhr" not in self.cacheable_resource_types:
+                self.cacheable_resource_types.append("xhr")
+            if "fetch" not in self.cacheable_resource_types:
+                self.cacheable_resource_types.append("fetch")
+
+        # 添加缓存性能统计
+        self.cache_performance_stats = {
+            "cache_read_times": [],  # Redis读取时间
+            "snapshot_read_times": [],  # 快照读取时间
+            "cache_hit_count": 0,
+            "cache_miss_count": 0,
+            "snapshot_hit_count": 0,
+            "snapshot_miss_count": 0
+        }
+
     def close(self):
         if self.task:
             # stop the task
@@ -177,6 +230,10 @@ class BrowserEnv(gym.Env, ABC):
             # close the browser
             self.browser.close()
             self.task = None
+        if self.enable_context_cache:
+            self.redis_client.close()
+            self.browser_cache_hit_stats = {}
+            self.redis_client = None
 
     def reset(self, seed=None, *args, **kwargs):
         super().reset(seed=seed, *args, **kwargs)
@@ -246,6 +303,10 @@ class BrowserEnv(gym.Env, ABC):
             # will raise an Exception if above args are overriden
             **self.pw_context_kwargs,
         )
+
+        if self.enable_context_cache:
+            self.context.route("**/*", self._handle_route)
+
         self.context.add_init_script(self.stealth_js_script)
 
         # set default timeout
@@ -336,6 +397,10 @@ document.addEventListener("visibilitychange", () => {
         # perform a safety check
         self._active_page_check()
 
+        # 如果启用了页面快照，捕获当前页面状态
+        if self.enable_page_snapshot and self.enable_context_cache:
+            self._capture_page_snapshot(self.page, self.page.url)
+
         # init start time
         self.start_time = time.time()
 
@@ -352,6 +417,23 @@ document.addEventListener("visibilitychange", () => {
 
         info = {}
         info["task_info"] = task_info
+
+        if self.enable_context_cache and self.redis_client:
+            # 记录 url 是否被缓存，没命中的话，记录 url 对应的次数为 0，命中就+1
+            info["browser_cache_hit_stats"] = self.browser_cache_hit_stats
+            
+            # 添加缓存性能统计
+            cache_stats = self.cache_performance_stats
+            info["cache_performance"] = {
+                "total_cache_reads": len(cache_stats["cache_read_times"]),
+                "avg_cache_read_time": sum(cache_stats["cache_read_times"]) / len(cache_stats["cache_read_times"]) if cache_stats["cache_read_times"] else 0,
+                "max_cache_read_time": max(cache_stats["cache_read_times"]) if cache_stats["cache_read_times"] else 0,
+                "cache_hit_rate": cache_stats["cache_hit_count"] / (cache_stats["cache_hit_count"] + cache_stats["cache_miss_count"]) if (cache_stats["cache_hit_count"] + cache_stats["cache_miss_count"]) > 0 else 0,
+                "total_snapshot_reads": len(cache_stats["snapshot_read_times"]),
+                "avg_snapshot_read_time": sum(cache_stats["snapshot_read_times"]) / len(cache_stats["snapshot_read_times"]) if cache_stats["snapshot_read_times"] else 0,
+                "max_snapshot_read_time": max(cache_stats["snapshot_read_times"]) if cache_stats["snapshot_read_times"] else 0,
+                "snapshot_hit_rate": cache_stats["snapshot_hit_count"] / (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) if (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) > 0 else 0,
+            }
 
         # TODO this is a bit hacky, find a better solution to record videos
         if self.record_video_dir:
@@ -441,6 +523,23 @@ document.addEventListener("visibilitychange", () => {
         )  # task or agent can terminate the episode
         truncated = False
 
+        if self.enable_context_cache and self.redis_client:
+            # 记录 url 是否被缓存，没命中的话，记录 url 对应的次数为 0，命中就+1
+            info["browser_cache_hit_stats"] = self.browser_cache_hit_stats
+            
+            # 添加缓存性能统计
+            cache_stats = self.cache_performance_stats
+            info["cache_performance"] = {
+                "total_cache_reads": len(cache_stats["cache_read_times"]),
+                "avg_cache_read_time": sum(cache_stats["cache_read_times"]) / len(cache_stats["cache_read_times"]) if cache_stats["cache_read_times"] else 0,
+                "max_cache_read_time": max(cache_stats["cache_read_times"]) if cache_stats["cache_read_times"] else 0,
+                "cache_hit_rate": cache_stats["cache_hit_count"] / (cache_stats["cache_hit_count"] + cache_stats["cache_miss_count"]) if (cache_stats["cache_hit_count"] + cache_stats["cache_miss_count"]) > 0 else 0,
+                "total_snapshot_reads": len(cache_stats["snapshot_read_times"]),
+                "avg_snapshot_read_time": sum(cache_stats["snapshot_read_times"]) / len(cache_stats["snapshot_read_times"]) if cache_stats["snapshot_read_times"] else 0,
+                "max_snapshot_read_time": max(cache_stats["snapshot_read_times"]) if cache_stats["snapshot_read_times"] else 0,
+                "snapshot_hit_rate": cache_stats["snapshot_hit_count"] / (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) if (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) > 0 else 0,
+            }
+
         return obs, reward, terminated, truncated, info
 
     def _task_validate(self):
@@ -518,6 +617,394 @@ document.addEventListener("visibilitychange", () => {
         # active page should not be closed
         if self.page.is_closed():
             raise RuntimeError(f"Unexpected: active page has been closed ({self.page}).")
+
+    def _handle_route(self, route: playwright.sync_api.Route):
+        # 如果启用了页面快照，使用快照缓存策略
+        if self.enable_page_snapshot:
+            self._handle_route_with_snapshot(route)
+        else:
+            self._handle_route_with_http_cache(route)
+
+    def _handle_route_with_snapshot(self, route: playwright.sync_api.Route):
+        """使用页面快照的路由处理"""
+        request = route.request
+        
+        # 只对主文档使用快照，其他资源正常处理
+        if request.resource_type == "document":
+            snapshot_key = self._generate_snapshot_key(request.url)
+            
+            # 检查是否有页面快照
+            snapshot = self._get_page_snapshot(snapshot_key)
+            if snapshot:
+                logger.debug(f"Serving page from snapshot: {request.url}")
+                self._serve_page_snapshot(route, snapshot)
+                return
+        
+        # 对于非文档请求或无快照情况，使用普通HTTP缓存
+        self._handle_route_with_http_cache(route)
+
+    def _handle_route_with_http_cache(self, route: playwright.sync_api.Route):
+        """原有的HTTP缓存路由处理"""
+        request = route.request
+        # Only cache GET requests for specific resource types
+        if request.method.upper() != "GET" or request.resource_type not in self.cacheable_resource_types:
+            route.continue_()
+            return
+
+        cache_key = self._generate_cache_key(request.url)
+        lock_key = f"lock:{cache_key}"
+
+        # 检查缓存
+        cached_response = self._get_from_cache(cache_key)
+        if cached_response and self._validate_cached_response(cached_response):
+            self._serve_from_cache(route, cached_response)
+            # 记录缓存命中统计
+            url_host = request.url.split('/')[2] if '/' in request.url else request.url
+            self.browser_cache_hit_stats[url_host] = self.browser_cache_hit_stats.get(url_host, 0) + 1
+            return
+
+        # 获取分布式锁
+        if self._acquire_lock(lock_key):
+            try:
+                # 双重检查，避免重复请求
+                cached_response = self._get_from_cache(cache_key)
+                if cached_response and self._validate_cached_response(cached_response):
+                    self._serve_from_cache(route, cached_response)
+                    return
+
+                # 尝试获取并缓存响应
+                success = self._fetch_and_cache_response(route, cache_key)
+                if not success:
+                    logger.warning(f"Failed to fetch and cache {request.url}, falling back to direct request")
+                    route.continue_()
+                    
+            finally:
+                self._release_lock(lock_key)
+        else:
+            # 如果获取锁失败，等待一小段时间后再次检查缓存
+            time.sleep(0.1)
+            cached_response = self._get_from_cache(cache_key)
+            if cached_response and self._validate_cached_response(cached_response):
+                self._serve_from_cache(route, cached_response)
+            else:
+                # 如果仍然没有缓存，直接请求
+                route.continue_()
+
+    def _generate_snapshot_key(self, url: str) -> str:
+        """生成页面快照的缓存键"""
+        return f"snapshot:{hashlib.md5(url.encode('utf-8')).hexdigest()}"
+
+    def _capture_page_snapshot(self, page: playwright.sync_api.Page, url: str):
+        """捕获页面快照"""
+        try:
+            # 等待页面完全加载（包括动态内容）
+            logger.debug(f"Waiting for page to load completely: {url}")
+            page.wait_for_load_state("networkidle", timeout=self.snapshot_wait_time)
+            
+            # 等待额外时间确保所有异步操作完成
+            time.sleep(1)
+            
+            # 获取完整的页面内容
+            html_content = page.content()
+            
+            # 获取页面的所有状态信息
+            snapshot_data = {
+                "url": url,
+                "html_content": html_content,
+                "title": page.title(),
+                "viewport": page.viewport_size,
+                "timestamp": int(time.time() * 1000),
+                "user_agent": page.evaluate("navigator.userAgent"),
+                # 可以添加更多状态信息
+            }
+            
+            # 保存快照
+            snapshot_key = self._generate_snapshot_key(url)
+            self._save_page_snapshot(snapshot_key, snapshot_data)
+            
+            logger.debug(f"Page snapshot captured for: {url}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to capture page snapshot for {url}: {e}")
+
+    def _save_page_snapshot(self, snapshot_key: str, snapshot_data: dict):
+        """保存页面快照到Redis"""
+        try:
+            self.redis_client.set(
+                snapshot_key, 
+                json.dumps(snapshot_data), 
+                ex=self.cache_ttl
+            )
+        except Exception as e:
+            logger.error(f"Failed to save page snapshot: {e}")
+
+    def _get_page_snapshot(self, snapshot_key: str) -> dict | None:
+        """从Redis获取页面快照"""
+        start_time = time.time()
+        try:
+            data = self.redis_client.get(snapshot_key)
+            read_time = time.time() - start_time
+            self.cache_performance_stats["snapshot_read_times"].append(read_time)
+            
+            if data:
+                snapshot = json.loads(data)
+                # 检查快照是否过期
+                if time.time() * 1000 - snapshot["timestamp"] < self.cache_ttl * 1000:
+                    self.cache_performance_stats["snapshot_hit_count"] += 1
+                    logger.debug(f"Snapshot cache hit for key {snapshot_key[:8]}... (read time: {read_time:.4f}s)")
+                    return snapshot
+                self.redis_client.delete(snapshot_key)
+            
+            self.cache_performance_stats["snapshot_miss_count"] += 1
+            logger.debug(f"Snapshot cache miss for key {snapshot_key[:8]}... (read time: {read_time:.4f}s)")
+            return None
+        except Exception as e:
+            read_time = time.time() - start_time
+            self.cache_performance_stats["snapshot_read_times"].append(read_time)
+            self.cache_performance_stats["snapshot_miss_count"] += 1
+            logger.error(f"Failed to get page snapshot (time: {read_time:.4f}s): {e}")
+            return None
+
+    def _serve_page_snapshot(self, route: playwright.sync_api.Route, snapshot: dict):
+        """使用页面快照响应请求"""
+        try:
+            html_content = snapshot["html_content"]
+            
+            # 构造响应头
+            headers = {
+                "content-type": "text/html; charset=utf-8",
+                "cache-control": "no-cache",
+                "x-snapshot-served": "true",
+                "x-snapshot-timestamp": str(snapshot["timestamp"])
+            }
+            
+            route.fulfill(
+                status=200,
+                headers=headers,
+                body=html_content.encode('utf-8')
+            )
+            
+            # 记录快照命中统计
+            url_host = route.request.url.split('/')[2] if '/' in route.request.url else route.request.url
+            self.browser_cache_hit_stats[url_host] = self.browser_cache_hit_stats.get(url_host, 0) + 1
+            
+        except Exception as e:
+            logger.error(f"Failed to serve page snapshot: {e}")
+            route.continue_()
+
+    def _validate_cached_response(self, cached_response: dict) -> bool:
+        """验证缓存响应的完整性"""
+        try:
+            # 检查必要的字段是否存在
+            required_fields = ["status", "headers", "body_b64", "timestamp"]
+            if not all(field in cached_response for field in required_fields):
+                logger.warning("Cached response missing required fields")
+                return False
+            
+            # 检查响应状态码
+            if cached_response["status"] >= 400:
+                logger.warning(f"Cached response has error status: {cached_response['status']}")
+                return False
+            
+            # 检查body是否为有效的base64编码
+            try:
+                body_bytes = base64.b64decode(cached_response["body_b64"])
+            except Exception as e:
+                logger.warning(f"Invalid base64 in cached response: {e}")
+                return False
+            
+            # 检查内容长度一致性
+            headers = cached_response["headers"]
+            if "content-length" in headers:
+                expected_length = int(headers["content-length"])
+                if len(body_bytes) != expected_length:
+                    logger.warning(f"Content length mismatch: expected {expected_length}, got {len(body_bytes)}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error validating cached response: {e}")
+            return False
+
+    def _serve_from_cache(self, route: playwright.sync_api.Route, cached_response: dict):
+        """从缓存中提供响应"""
+        try:
+            headers = cached_response["headers"].copy()
+            # 移除可能导致问题的headers
+            problematic_headers = ("content-security-policy", "content-length", "x-frame-options")
+            for header in problematic_headers:
+                headers.pop(header, None)
+            
+            route.fulfill(
+                status=cached_response["status"],
+                headers=headers,
+                body=base64.b64decode(cached_response["body_b64"]),
+            )
+        except Exception as e:
+            logger.error(f"Error serving from cache: {e}")
+            route.continue_()
+
+    def _fetch_and_cache_response(self, route: playwright.sync_api.Route, cache_key: str, max_retries: int = 2) -> bool:
+        """获取响应并缓存，带重试机制"""
+        for attempt in range(max_retries + 1):
+            try:
+                # 获取响应
+                response = route.fetch()
+                
+                # 验证响应状态
+                if response.status >= 400:
+                    logger.warning(f"HTTP error {response.status} for {route.request.url}")
+                    if attempt < max_retries:
+                        logger.info(f"Retrying... ({attempt + 1}/{max_retries})")
+                        time.sleep(0.5 * (attempt + 1))  # 指数退避
+                        continue
+                    else:
+                        return False
+                
+                # 获取响应体
+                body_bytes = response.body()
+                
+                # 验证内容完整性
+                if not self._validate_response_integrity(response, body_bytes):
+                    if attempt < max_retries:
+                        logger.info(f"Content integrity check failed, retrying... ({attempt + 1}/{max_retries})")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        logger.warning(f"Content integrity check failed after {max_retries} retries")
+                        return False
+                
+                # 准备缓存数据
+                headers = response.headers.copy()
+                # 移除可能影响缓存的编码头
+                headers.pop("content-encoding", None)
+                
+                data_to_cache = {
+                    "status": response.status,
+                    "headers": headers,
+                    "body_b64": base64.b64encode(body_bytes).decode("ascii"),
+                    "url": route.request.url,  # 添加URL用于调试
+                    "fetch_time": int(time.time() * 1000),  # 添加获取时间
+                }
+                
+                # 保存到缓存
+                self._save_to_cache(cache_key, data_to_cache)
+                
+                # 提供响应
+                serve_headers = headers.copy()
+                problematic_headers = ("content-security-policy", "content-length", "x-frame-options")
+                for header in problematic_headers:
+                    serve_headers.pop(header, None)
+                
+                route.fulfill(
+                    status=response.status,
+                    headers=serve_headers,
+                    body=body_bytes
+                )
+                
+                logger.debug(f"Successfully cached and served {route.request.url}")
+                return True
+                
+            except playwright.sync_api.TimeoutError as e:
+                logger.warning(f"Timeout fetching {route.request.url}: {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying due to timeout... ({attempt + 1}/{max_retries})")
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                else:
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Error fetching {route.request.url} (attempt {attempt + 1}): {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying due to error... ({attempt + 1}/{max_retries})")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                else:
+                    return False
+        
+        return False
+
+    def _validate_response_integrity(self, response: playwright.sync_api.Response, body_bytes: bytes) -> bool:
+        """验证响应完整性"""
+        try:
+            # 检查Content-Length头部
+            content_length_header = response.headers.get("content-length")
+            if content_length_header:
+                expected_length = int(content_length_header)
+                actual_length = len(body_bytes)
+                if actual_length != expected_length:
+                    logger.warning(
+                        f"Content length mismatch for {response.url}: "
+                        f"expected {expected_length}, got {actual_length}"
+                    )
+                    return False
+            
+            # 对于HTML文档，检查是否有基本的HTML结构
+            if response.headers.get("content-type", "").startswith("text/html"):
+                body_text = body_bytes.decode("utf-8", errors="ignore").lower()
+                if not (body_text.strip().startswith("<!doctype") or body_text.strip().startswith("<html")):
+                    logger.warning(f"HTML document appears incomplete for {response.url}")
+                    return False
+            
+            # 对于JSON，检查是否是有效的JSON
+            elif response.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    json.loads(body_bytes.decode("utf-8"))
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON response for {response.url}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error validating response integrity: {e}")
+            return True  # 如果验证失败，默认认为是有效的，避免阻止正常流程
+
+    def _generate_cache_key(self, url: str) -> str:
+        """Generate MD5 hash based on URL as cache key"""
+        return hashlib.md5(url.encode("utf-8")).hexdigest()
+
+    def _save_to_cache(self, cache_key: str, data: dict):
+        """Save data to Redis cache"""
+        data["timestamp"] = int(time.time() * 1000)
+        self.redis_client.set(cache_key, json.dumps(data), ex=self.cache_ttl)
+
+    def _get_from_cache(self, cache_key: str) -> dict | None:
+        """Read data from Redis cache"""
+        start_time = time.time()
+        try:
+            data = self.redis_client.get(cache_key)
+            read_time = time.time() - start_time
+            self.cache_performance_stats["cache_read_times"].append(read_time)
+            
+            if data:
+                parsed = json.loads(data)
+                # cache_ttl is in seconds, timestamp is in ms
+                if time.time() * 1000 - parsed["timestamp"] < self.cache_ttl * 1000:
+                    self.cache_performance_stats["cache_hit_count"] += 1
+                    logger.debug(f"Cache hit for key {cache_key[:8]}... (read time: {read_time:.4f}s)")
+                    return parsed
+                self.redis_client.delete(cache_key)  # Delete expired cache
+            
+            self.cache_performance_stats["cache_miss_count"] += 1
+            logger.debug(f"Cache miss for key {cache_key[:8]}... (read time: {read_time:.4f}s)")
+            return None
+        except (json.JSONDecodeError, TypeError) as e:
+            read_time = time.time() - start_time
+            self.cache_performance_stats["cache_read_times"].append(read_time)
+            self.cache_performance_stats["cache_miss_count"] += 1
+            logger.debug(f"Cache read error for key {cache_key[:8]}... (time: {read_time:.4f}s): {e}")
+            return None
+
+    def _acquire_lock(self, lock_key: str, timeout: int = 10) -> bool:
+        """Acquire Redis distributed lock"""
+        return self.redis_client.set(lock_key, "locked", ex=timeout, nx=True)
+
+    def _release_lock(self, lock_key: str):
+        """Release Redis distributed lock"""
+        self.redis_client.delete(lock_key)
 
     def _get_obs(self):
 
