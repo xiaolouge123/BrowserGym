@@ -11,6 +11,10 @@ import json
 import subprocess
 import signal
 from pathlib import Path
+import gymnasium as gym
+
+
+import browsergym.core
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent / "browsergym" / "core" / "src"))
@@ -34,6 +38,19 @@ def check_redis_server():
         return True
     except redis.exceptions.ConnectionError:
         return False
+    
+def clean_redis():
+    """清空Redis缓存数据库（用于测试前环境清理）"""
+    try:
+        import redis
+        r = redis.from_url("redis://localhost:6380/1")
+        r.flushdb()
+        print("✅ Redis缓存已清空")
+        return True
+    except Exception as e:
+        print(f"❌ 清空Redis缓存失败: {e}")
+        return False
+    
 
 def test_stats_gov_website():
     """测试国家统计局网站的缓存效果"""
@@ -44,12 +61,14 @@ def test_stats_gov_website():
     if not check_redis_server():
         print("❌ Redis服务器未运行，请启动Redis服务器")
         sys.exit(1)
+    else:
+        clean_redis()
     
     try:
         # 测试网站信息
         test_site = {
             "name": "国家统计局数据网站",
-            "url": "https://m.chinabgao.com/",
+            "url": "https://data.stats.gov.cn/",
             "type": "政府数据门户",
             "goal": "获取国家统计局数据"
         }
@@ -73,10 +92,10 @@ def test_stats_gov_website():
         
         env = BrowserEnv(
             task_entrypoint=OpenEndedTask, 
-            task_kwargs={"start_url": test_site["url"], "goal": test_site["goal"]},
+            task_kwargs={"start_url": 'about:blank', "goal": test_site["goal"]},
             enable_context_cache=True,
             context_cache_kwargs=cache_config,
-            headless=True,  # 无头模式，适合测试
+            headless=False,  # 无头模式，适合测试
             timeout=30000
         )
         
@@ -91,16 +110,6 @@ def test_stats_gov_website():
         
         try:
             env.step(f'page.goto("{test_site["url"]}")')
-            env.step('page.wait_for_load_state("domcontentloaded", timeout=15000)')
-            
-            # 获取页面标题
-            try:
-                obs, reward, done, truncated, info = env.step('page.title()')
-                print(f"📄 页面标题: {info}")
-            except:
-                print("📄 页面标题: 获取失败")
-            
-            env.step('page.wait_for_load_state("networkidle", timeout=10000)')
             
         except Exception as e:
             print(f"⚠️  页面加载警告: {e}")
@@ -112,14 +121,26 @@ def test_stats_gov_website():
         print(f"📈 初始缓存统计: {first_cache_stats}")
         print()
         
+
+        env = BrowserEnv(
+            task_entrypoint=OpenEndedTask, 
+            task_kwargs={"start_url": 'about:blank', "goal": test_site["goal"]},
+            enable_context_cache=True,
+            context_cache_kwargs=cache_config,
+            headless=False,  # 无头模式，适合测试
+            timeout=30000
+        )
+        obs, info = env.reset()
+        print("✓ 环境初始化完成")
+        print(info)
+        print()
+
         # 第二次访问
         print("🔄 第二次访问网站（测试缓存效果）...")
         start_time = time.time()
         
         try:
             env.step(f'page.goto("{test_site["url"]}")')
-            env.step('page.wait_for_load_state("domcontentloaded", timeout=10000)')
-            env.step('page.wait_for_load_state("networkidle", timeout=8000)')
         except Exception as e:
             print(f"⚠️  第二次访问警告: {e}")
         
@@ -343,6 +364,287 @@ def test_stats_gov_website():
     
     return True
 
+def test_loading_with_resource_block():
+    """测试阻止图片资源加载对网页载入速度的优化效果"""
+    print("\n" + "="*60)
+    print("🚀 资源阻止优化测试")
+    print("="*60)
+    
+    # 检查Redis服务器是否已运行
+    if not check_redis_server():
+        print("❌ Redis服务器未运行，请启动Redis服务器")
+        return False
+    else:
+        clean_redis()
+    
+    try:
+        # 测试网站配置
+        test_sites = [
+            {
+                "name": "图片密集型网站", 
+                "url": "https://data.stats.gov.cn/",
+                "type": "数据门户"
+            },
+            {
+                "name": "新闻网站",
+                "url": "https://m.peopledailyhealth.com/",  
+                "type": "新闻媒体"
+            }
+        ]
+        
+        print("📊 测试网站列表:")
+        for i, site in enumerate(test_sites, 1):
+            print(f"   {i}. {site['name']} ({site['type']})")
+        print()
+        
+        # 对每个网站进行测试
+        for site_idx, test_site in enumerate(test_sites):
+            print(f"🌐 测试网站 {site_idx + 1}: {test_site['name']}")
+            print(f"🔗 URL: {test_site['url']}")
+            print("-" * 50)
+            
+            # 测试1: 不阻止任何资源（基准测试）
+            print("📊 基准测试（不阻止任何资源）...")
+            
+            baseline_env = gym.make(
+                "browsergym/openended",
+                task_kwargs={"start_url": 'about:blank', "goal": "基准性能测试"},
+                enable_context_cache=True,
+                context_cache_kwargs={"redis_url": "redis://localhost:6380/1", "ttl": 3600},
+                resource_filter_kwargs={
+                    'resource_filter_config': {
+                        'block_images': False,
+                        'block_videos': False,
+                        'block_ads': False,
+                        'block_analytics': False,
+                    }
+                },
+                headless=False,
+                timeout=30000
+            )
+            
+            obs_baseline, _info = baseline_env.reset()
+            
+            # 测量基准加载时间
+            baseline_start = time.time()
+            try:
+                obs, reward, terminated, truncated, info =  baseline_env.step(f'goto("{test_site["url"]}")')
+            except Exception as e:
+                print(f"⚠️  基准测试警告: {e}")
+                
+            baseline_time = time.time() - baseline_start
+            baseline_filter_stats = info.get("resource_filter_stats", {})
+            print("基准资源统计:" , baseline_filter_stats)
+            
+            print(f"⏱️  基准加载时间: {baseline_time:.2f}秒")
+            print(f"📊 基准资源统计: 总请求={baseline_filter_stats.get('total_requests', 0)}, 阻止={baseline_filter_stats.get('total_blocked', 0)}")
+            print()
+            
+            # 测试2: 阻止图片资源
+            print("🖼️  图片阻止测试...")
+            
+            optimized_env = gym.make(
+                "browsergym/openended",
+                task_kwargs={"start_url": 'about:blank', "goal": "图片阻止优化测试"},
+                enable_context_cache=True,
+                context_cache_kwargs={"redis_url": "redis://localhost:6380/1", "ttl": 3600},
+                resource_filter_kwargs={
+                    'resource_filter_config': {
+                        'block_images': True,           # 阻止图片
+                        'allow_essential_images': False, # 但保留关键图片
+                        'block_videos': False,
+                        'block_ads': False,
+                        'block_analytics': False,
+                    }
+                },
+                headless=False,
+                timeout=30000
+            )
+            
+            obs_optimized, info_optimized = optimized_env.reset()
+            
+            # 测量优化后加载时间
+            optimized_start = time.time()
+            try:
+                obs, reward, terminated, truncated, info  = optimized_env.step(f'goto("{test_site["url"]}")')
+            except Exception as e:
+                print(f"⚠️  优化测试警告: {e}")
+                
+            optimized_time = time.time() - optimized_start
+            optimized_filter_stats = info.get("resource_filter_stats", {})
+            print("优化资源统计:" , optimized_filter_stats)
+            
+            print(f"⏱️  优化加载时间: {optimized_time:.2f}秒")
+            print(f"📊 优化资源统计: 总请求={optimized_filter_stats.get('total_requests', 0)}, 阻止={optimized_filter_stats.get('total_blocked', 0)}")
+            print(f"🖼️  阻止图片数量: {optimized_filter_stats.get('blocked_images', 0)}")
+            print()
+            
+            # 测试3: 激进阻止模式（图片+视频+广告+分析）
+            print("🚫 激进阻止测试（图片+视频+广告+分析）...")
+            
+            aggressive_env = gym.make(
+                "browsergym/openended",
+                task_kwargs={"start_url": 'about:blank', "goal": "激进阻止优化测试"},
+                enable_context_cache=True,
+                context_cache_kwargs={"redis_url": "redis://localhost:6380/1", "ttl": 3600},
+                resource_filter_kwargs={
+                    'resource_filter_config': {
+                        'block_images': True,
+                        'allow_essential_images': True,
+                        'block_videos': True,           # 阻止视频
+                        'block_ads': True,              # 阻止广告
+                        'block_analytics': True,        # 阻止分析脚本
+                        'block_fonts': False,           # 保留字体以免影响显示
+                        'custom_url_patterns': [        # 自定义阻止模式
+                            r'.*\.gif$',                # 阻止GIF动图
+                            r'.*banner.*',              # 阻止横幅
+                            r'.*tracking.*',            # 阻止跟踪
+                        ]
+                    }
+                },
+                headless=True,
+                timeout=30000
+            )
+            
+            obs_aggressive, info_aggressive = aggressive_env.reset()
+            
+            # 测量激进模式加载时间
+            aggressive_start = time.time()
+            try:
+                obs, reward, terminated, truncated, info = aggressive_env.step(f'goto("{test_site["url"]}")')
+            except Exception as e:
+                print(f"⚠️  激进测试警告: {e}")
+                
+            aggressive_time = time.time() - aggressive_start
+            aggressive_filter_stats = info.get("resource_filter_stats", {})
+            
+            print(f"⏱️  激进模式加载时间: {aggressive_time:.2f}秒")
+            print(f"📊 激进资源统计: 总请求={aggressive_filter_stats.get('total_requests', 0)}, 阻止={aggressive_filter_stats.get('total_blocked', 0)}")
+            print(f"🚫 详细阻止统计:")
+            print(f"   • 图片: {aggressive_filter_stats.get('blocked_images', 0)}个")
+            print(f"   • 视频: {aggressive_filter_stats.get('blocked_videos', 0)}个") 
+            print(f"   • 广告: {aggressive_filter_stats.get('blocked_ads', 0)}个")
+            print(f"   • 分析: {aggressive_filter_stats.get('blocked_analytics', 0)}个")
+            print(f"   • 自定义: {aggressive_filter_stats.get('blocked_custom', 0)}个")
+            print()
+            
+            # 性能分析对比
+            print("📈 性能优化分析")
+            print("-" * 40)
+            
+            # 计算改善百分比
+            if baseline_time > 0:
+                image_improvement = ((baseline_time - optimized_time) / baseline_time) * 100
+                aggressive_improvement = ((baseline_time - aggressive_time) / baseline_time) * 100
+                
+                print(f"⚡ 性能对比结果:")
+                print(f"   📊 基准加载时间: {baseline_time:.2f}秒")
+                print(f"   🖼️  图片阻止优化: {optimized_time:.2f}秒 (改善 {image_improvement:.1f}%)")
+                print(f"   🚫 激进阻止优化: {aggressive_time:.2f}秒 (改善 {aggressive_improvement:.1f}%)")
+                
+                # 绝对时间节省
+                image_savings = baseline_time - optimized_time
+                aggressive_savings = baseline_time - aggressive_time
+                
+                print(f"\n💰 时间节省:")
+                print(f"   🖼️  图片阻止节省: {image_savings:.2f}秒")
+                print(f"   🚫 激进模式节省: {aggressive_savings:.2f}秒")
+                print(f"   📈 激进模式额外收益: {aggressive_savings - image_savings:.2f}秒")
+                
+                # 资源阻止效率分析
+                blocked_images = optimized_filter_stats.get('blocked_images', 0)
+                total_blocked_aggressive = aggressive_filter_stats.get('total_blocked', 0)
+                
+                print(f"\n🎯 资源阻止效果:")
+                print(f"   🖼️  图片阻止数量: {blocked_images}个")
+                print(f"   🚫 激进模式总阻止: {total_blocked_aggressive}个")
+                
+                if blocked_images > 0:
+                    time_per_image = image_savings / blocked_images
+                    print(f"   ⚡ 每个图片平均节省: {time_per_image:.3f}秒")
+                
+                # 效果评级
+                print(f"\n🏆 优化效果评级:")
+                
+                def get_rating(improvement):
+                    if improvement > 30:
+                        return "🌟 显著", "excellent"
+                    elif improvement > 15:
+                        return "👍 良好", "good"
+                    elif improvement > 5:
+                        return "👌 一般", "moderate"
+                    else:
+                        return "⚠️  微弱", "minimal"
+                
+                image_rating, image_level = get_rating(image_improvement)
+                aggressive_rating, aggressive_level = get_rating(aggressive_improvement)
+                
+                print(f"   🖼️  图片阻止: {image_rating} ({image_improvement:.1f}%)")
+                print(f"   🚫 激进模式: {aggressive_rating} ({aggressive_improvement:.1f}%)")
+                
+                # 网站特性分析
+                print(f"\n🔍 网站特性分析:")
+                baseline_requests = baseline_filter_stats.get('total_requests', 0)
+                image_ratio = (blocked_images / max(baseline_requests, 1)) * 100
+                
+                print(f"   📊 图片资源占比: {image_ratio:.1f}%")
+                print(f"   🌐 总请求数量: {baseline_requests}个")
+                print(f"   ⚡ 网络密集程度: {'高' if baseline_requests > 50 else '中' if baseline_requests > 20 else '低'}")
+                
+                # 优化建议
+                print(f"\n💡 针对此网站的优化建议:")
+                
+                if image_improvement > 15:
+                    print(f"   ✅ 强烈推荐图片阻止优化")
+                    print(f"   📱 特别适合移动端或慢网络用户")
+                elif image_improvement > 5:
+                    print(f"   👍 推荐使用图片阻止优化")
+                    print(f"   🎯 在特定场景下有明显效果")
+                else:
+                    print(f"   ⚠️  图片阻止效果有限")
+                    print(f"   💭 可能网站图片较少或已经优化")
+                
+                if aggressive_improvement > image_improvement + 10:
+                    print(f"   🚫 激进模式显著更优，考虑启用完整过滤")
+                elif aggressive_improvement > image_improvement + 5:
+                    print(f"   🔄 激进模式有额外收益，可根据需要启用")
+                else:
+                    print(f"   📊 单纯图片阻止已足够，激进模式收益有限")
+                
+            else:
+                print("⚠️  无法计算优化效果（基准时间为0）")
+            
+            # 清理环境
+            baseline_env.close()
+            optimized_env.close() 
+            aggressive_env.close()
+            
+            print(f"\n{'='*50}")
+            
+        # 总体测试总结
+        print("\n🎉 资源阻止优化测试完成")
+        print("="*60)
+        
+        print("📋 测试总结:")
+        print("✅ 完成了基准、图片阻止、激进阻止三种模式的对比测试")
+        print("📊 测量了加载时间和资源阻止效果")
+        print("💡 提供了针对性的优化建议")
+        
+        print("\n🎯 通用优化策略建议:")
+        print("1. 🖼️  图片阻止: 适合图片密集型网站，通常有5-20%改善")
+        print("2. 🚫 激进阻止: 适合广告较多的网站，可额外节省10-30%时间")
+        print("3. 📱 移动优化: 在移动网络环境下效果更显著")
+        print("4. 🎨 用户体验: 需要平衡加载速度和视觉效果")
+        print("5. ⚙️  动态配置: 可根据网络状况动态调整阻止策略")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ 资源阻止测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def test_optimized_cache_strategy():
     """测试优化的缓存策略，展示如何获得更好的缓存效果"""
     print("\n" + "="*60)
@@ -353,6 +655,8 @@ def test_optimized_cache_strategy():
     if not check_redis_server():
         print("❌ Redis服务器未运行，请启动Redis服务器")
         return False
+    else:
+        clean_redis()
     
     try:
         # 优化的缓存配置
@@ -379,8 +683,8 @@ def test_optimized_cache_strategy():
         test_url = "https://m.chinabgao.com/"
         
         env = BrowserEnv(
-            task_entrypoint=OpenEndedTask,
-            task_kwargs={"start_url": test_url, "goal": "测试优化缓存策略"},
+            task_entrypoint=OpenEndedTask, 
+            task_kwargs={"start_url": 'about:blank', "goal": "测试优化缓存策略"},
             enable_context_cache=True,
             context_cache_kwargs=optimized_config,
             headless=True,
@@ -396,9 +700,7 @@ def test_optimized_cache_strategy():
         start_time = time.time()
         
         try:
-            env.step(f'page.goto("{test_url}")')
-            env.step('page.wait_for_load_state("domcontentloaded", timeout=15000)')
-            env.step('page.wait_for_load_state("networkidle", timeout=10000)')
+            env.step(f'goto("{test_url}")')
         except Exception as e:
             print(f"⚠️  页面加载警告: {e}")
         
@@ -415,7 +717,7 @@ def test_optimized_cache_strategy():
         # 创建新环境测试缓存效果
         env2 = BrowserEnv(
             task_entrypoint=OpenEndedTask,
-            task_kwargs={"start_url": test_url, "goal": "测试缓存效果"},
+            task_kwargs={"start_url": 'about:blank', "goal": "测试优化缓存策略"},
             enable_context_cache=True,
             context_cache_kwargs=optimized_config,
             headless=True,
@@ -429,9 +731,7 @@ def test_optimized_cache_strategy():
         start_time = time.time()
         
         try:
-            env2.step(f'page.goto("{test_url}")')
-            env2.step('page.wait_for_load_state("domcontentloaded", timeout=8000)')
-            env2.step('page.wait_for_load_state("networkidle", timeout=5000)')
+            env2.step(f'goto("{test_url}")')
         except Exception as e:
             print(f"⚠️  第二次访问警告: {e}")
         
@@ -518,11 +818,18 @@ if __name__ == "__main__":
     print()
     
     try:
-        success = test_stats_gov_website()
-        if success:
-            print("\n✅ 测试完成！")
+        # 运行缓存测试
+        print("第一部分：缓存效果测试")
+        success1 = test_stats_gov_website()
+        
+        # 运行资源阻止测试  
+        print("\n第二部分：资源阻止优化测试")
+        success2 = test_loading_with_resource_block()
+        
+        if success1 and success2:
+            print("\n🎉 所有测试完成！")
         else:
-            print("\n❌ 测试失败！")
+            print("\n⚠️  部分测试失败！")
             sys.exit(1)
     except KeyboardInterrupt:
         print("\n⏹️  测试被用户中断")

@@ -85,6 +85,7 @@ class BrowserEnv(gym.Env, ABC):
         action_mapping: Optional[callable] = HighLevelActionSet().to_python_code,
         enable_context_cache: bool = False,
         context_cache_kwargs: dict = {},
+        resource_filter_kwargs: dict = {},
     ):
         """
         Instantiate a ready to use BrowserEnv gym environment.
@@ -123,6 +124,7 @@ class BrowserEnv(gym.Env, ABC):
         self.action_mapping = action_mapping
         self.enable_context_cache = enable_context_cache
         self.context_cache_kwargs = context_cache_kwargs
+        self.resource_filter_kwargs = resource_filter_kwargs
 
         # check argument values
         assert tags_to_mark in ("all", "standard_html")
@@ -198,6 +200,56 @@ class BrowserEnv(gym.Env, ABC):
             'cacheable_resource_types', 
             ["document", "stylesheet", "image", "font", "script"]
         )
+        
+        # 添加更精细的资源过滤配置
+        self.resource_filter_config = self.resource_filter_kwargs.get(
+            'resource_filter_config', 
+            {
+                'block_images': False,  # 是否阻止图片
+                'block_videos': False,  # 是否阻止视频  
+                'block_stylesheets': False,  # 是否阻止CSS样式表
+                'block_scripts': False,  # 是否阻止JavaScript脚本
+                'block_fonts': False,  # 是否阻止字体文件
+                'block_websockets': False,  # 是否阻止WebSocket连接
+                'block_xhr_fetch': False,  # 是否阻止XHR/Fetch请求
+                'block_ads': False,     # 是否阻止广告
+                'block_analytics': False,  # 是否阻止分析脚本
+                'custom_url_patterns': [],  # 自定义URL过滤模式
+                'allow_essential_images': True,  # 是否允许关键图片（如logo、图标等）
+                'image_size_limit': None,  # 图片大小限制（字节）
+            }
+        )
+        
+        # 预编译广告和分析脚本的正则表达式
+        self.ad_patterns = [
+            r'.*google-analytics\.com.*',
+            r'.*googletagmanager\.com.*',
+            r'.*doubleclick\.net.*',
+            r'.*googlesyndication\.com.*',
+            r'.*facebook\.com/tr.*',
+            r'.*amazon-adsystem\.com.*',
+            r'.*ads\..*',
+            r'.*analytics\..*',
+            r'.*tracking\..*',
+        ]
+        
+        self.compiled_ad_patterns = [re.compile(pattern) for pattern in self.ad_patterns]
+        
+        # 添加过滤统计
+        self.resource_filter_stats = {
+            'blocked_images': 0,
+            'blocked_videos': 0,
+            'blocked_stylesheets': 0,
+            'blocked_scripts': 0,
+            'blocked_fonts': 0,
+            'blocked_websockets': 0,
+            'blocked_xhr_fetch': 0,
+            'blocked_ads': 0,
+            'blocked_analytics': 0,
+            'blocked_custom': 0,
+            'total_blocked': 0,
+            'total_requests': 0,
+        }
         
         # 页面快照功能配置
         self.enable_page_snapshot = self.context_cache_kwargs.get('enable_page_snapshot', False)
@@ -435,6 +487,25 @@ document.addEventListener("visibilitychange", () => {
                 "snapshot_hit_rate": cache_stats["snapshot_hit_count"] / (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) if (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) > 0 else 0,
             }
 
+        # 添加资源过滤统计信息
+        filter_stats = self.resource_filter_stats
+        info["resource_filter_stats"] = {
+            "total_requests": filter_stats["total_requests"],
+            "total_blocked": filter_stats["total_blocked"],
+            "blocked_images": filter_stats["blocked_images"],
+            "blocked_videos": filter_stats["blocked_videos"],
+            "blocked_ads": filter_stats["blocked_ads"],
+            "blocked_analytics": filter_stats["blocked_analytics"],
+            "blocked_custom": filter_stats["blocked_custom"],
+            "block_rate": filter_stats["total_blocked"] / filter_stats["total_requests"] if filter_stats["total_requests"] > 0 else 0,
+            "enabled_filters": {
+                "block_images": self.resource_filter_config.get('block_images', False),
+                "block_videos": self.resource_filter_config.get('block_videos', False),
+                "block_ads": self.resource_filter_config.get('block_ads', False),
+                "block_analytics": self.resource_filter_config.get('block_analytics', False),
+            }
+        }
+
         # TODO this is a bit hacky, find a better solution to record videos
         if self.record_video_dir:
             info["recording_start_time"] = recording_start_time
@@ -540,6 +611,25 @@ document.addEventListener("visibilitychange", () => {
                 "snapshot_hit_rate": cache_stats["snapshot_hit_count"] / (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) if (cache_stats["snapshot_hit_count"] + cache_stats["snapshot_miss_count"]) > 0 else 0,
             }
 
+        # 添加资源过滤统计信息
+        filter_stats = self.resource_filter_stats
+        info["resource_filter_stats"] = {
+            "total_requests": filter_stats["total_requests"],
+            "total_blocked": filter_stats["total_blocked"],
+            "blocked_images": filter_stats["blocked_images"],
+            "blocked_videos": filter_stats["blocked_videos"],
+            "blocked_ads": filter_stats["blocked_ads"],
+            "blocked_analytics": filter_stats["blocked_analytics"],
+            "blocked_custom": filter_stats["blocked_custom"],
+            "block_rate": filter_stats["total_blocked"] / filter_stats["total_requests"] if filter_stats["total_requests"] > 0 else 0,
+            "enabled_filters": {
+                "block_images": self.resource_filter_config.get('block_images', False),
+                "block_videos": self.resource_filter_config.get('block_videos', False),
+                "block_ads": self.resource_filter_config.get('block_ads', False),
+                "block_analytics": self.resource_filter_config.get('block_analytics', False),
+            }
+        }
+
         return obs, reward, terminated, truncated, info
 
     def _task_validate(self):
@@ -619,6 +709,11 @@ document.addEventListener("visibilitychange", () => {
             raise RuntimeError(f"Unexpected: active page has been closed ({self.page}).")
 
     def _handle_route(self, route: playwright.sync_api.Route):
+        # 首先检查是否需要过滤此资源
+        if self._should_block_resource(route):
+            self._block_resource(route)
+            return
+            
         # 如果启用了页面快照，使用快照缓存策略
         if self.enable_page_snapshot:
             self._handle_route_with_snapshot(route)
@@ -642,6 +737,165 @@ document.addEventListener("visibilitychange", () => {
         
         # 对于非文档请求或无快照情况，使用普通HTTP缓存
         self._handle_route_with_http_cache(route)
+
+    def _should_block_resource(self, route: playwright.sync_api.Route) -> bool:
+        """判断是否应该阻止某个资源请求"""
+        request = route.request
+        resource_type = request.resource_type
+        url = request.url
+        
+        # 统计总请求数
+        self.resource_filter_stats['total_requests'] += 1
+        
+        # 检查精细过滤配置
+        filter_config = self.resource_filter_config
+        
+        # 阻止图片
+        if filter_config.get('block_images', False) and resource_type == 'image':
+            # 如果允许关键图片，检查是否是关键图片
+            if filter_config.get('allow_essential_images', True):
+                if self._is_essential_image(url):
+                    return False
+            return True
+        
+        # 阻止视频
+        if filter_config.get('block_videos', False) and resource_type in ['media', 'video']:
+            return True
+        
+        # 阻止CSS样式表
+        if filter_config.get('block_stylesheets', False) and resource_type == 'stylesheet':
+            return True
+        
+        # 阻止JavaScript脚本
+        if filter_config.get('block_scripts', False) and resource_type == 'script':
+            return True
+        
+        # 阻止字体文件
+        if filter_config.get('block_fonts', False) and resource_type == 'font':
+            return True
+        
+        # 阻止WebSocket连接
+        if filter_config.get('block_websockets', False) and resource_type == 'websocket':
+            return True
+        
+        # 阻止XHR/Fetch请求
+        if filter_config.get('block_xhr_fetch', False) and resource_type in ['xhr', 'fetch']:
+            return True
+        
+        # 阻止广告和分析脚本
+        if filter_config.get('block_ads', False) or filter_config.get('block_analytics', False):
+            if self._is_ad_or_analytics_url(url):
+                return True
+        
+        # 检查自定义URL模式
+        custom_patterns = filter_config.get('custom_url_patterns', [])
+        for pattern in custom_patterns:
+            if re.search(pattern, url):
+                return True
+        
+        return False
+    
+    def _is_essential_image(self, url: str) -> bool:
+        """判断是否是关键图片（如logo、图标等）"""
+        essential_keywords = [
+            'logo', 'icon', 'favicon', 'sprite', 'button', 'background',
+            'avatar', 'profile', 'thumb', 'preview', 'banner'
+        ]
+        
+        url_lower = url.lower()
+        for keyword in essential_keywords:
+            if keyword in url_lower:
+                return True
+        
+        # 检查文件扩展名，某些小图标可能是关键的
+        if url_lower.endswith(('.ico', '.svg')):
+            return True
+        
+        return False
+    
+    def _is_ad_or_analytics_url(self, url: str) -> bool:
+        """判断URL是否是广告或分析脚本"""
+        for pattern in self.compiled_ad_patterns:
+            if pattern.match(url):
+                return True
+        return False
+    
+    def _block_resource(self, route: playwright.sync_api.Route):
+        """阻止资源请求"""
+        request = route.request
+        resource_type = request.resource_type
+        url = request.url
+        
+        # 更新统计信息
+        self.resource_filter_stats['total_blocked'] += 1
+        
+        if resource_type == 'image':
+            self.resource_filter_stats['blocked_images'] += 1
+        elif resource_type in ['media', 'video']:
+            self.resource_filter_stats['blocked_videos'] += 1
+        elif resource_type == 'stylesheet':
+            self.resource_filter_stats['blocked_stylesheets'] += 1
+        elif resource_type == 'script':
+            self.resource_filter_stats['blocked_scripts'] += 1
+        elif resource_type == 'font':
+            self.resource_filter_stats['blocked_fonts'] += 1
+        elif resource_type == 'websocket':
+            self.resource_filter_stats['blocked_websockets'] += 1
+        elif resource_type in ['xhr', 'fetch']:
+            self.resource_filter_stats['blocked_xhr_fetch'] += 1
+        elif self._is_ad_or_analytics_url(url):
+            if 'analytics' in url.lower():
+                self.resource_filter_stats['blocked_analytics'] += 1
+            else:
+                self.resource_filter_stats['blocked_ads'] += 1
+        else:
+            self.resource_filter_stats['blocked_custom'] += 1
+        
+        logger.debug(f"Blocked {resource_type} resource: {url}")
+        
+        # 为图片资源返回1x1透明图片，避免页面布局问题
+        if resource_type == 'image':
+            # 1x1透明PNG的base64编码
+            transparent_pixel = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+            )
+            route.fulfill(
+                status=200,
+                headers={"content-type": "image/png"},
+                body=transparent_pixel
+            )
+        # 为CSS资源返回空样式
+        elif resource_type == 'stylesheet':
+            route.fulfill(
+                status=200,
+                headers={"content-type": "text/css"},
+                body=""
+            )
+        # 为JS资源返回空脚本
+        elif resource_type == 'script':
+            route.fulfill(
+                status=200,
+                headers={"content-type": "application/javascript"},
+                body=""
+            )
+        # 为字体资源返回最小字体
+        elif resource_type == 'font':
+            # 返回一个最小的WOFF字体数据
+            minimal_font = base64.b64decode(
+                "d09GRgABAAAAAAQwAA0AAAAABiwAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABHREVGAAAE"
+                "FAAAAA4AAAAOABAADgASUEM="  # 最小WOFF字体
+            )
+            route.fulfill(
+                status=200,
+                headers={"content-type": "font/woff"},
+                body=minimal_font
+            )
+        # 为WebSocket和XHR/Fetch请求直接中止
+        elif resource_type in ['websocket', 'xhr', 'fetch']:
+            route.abort()
+        # 为其他资源类型直接中止请求
+        else:
+            route.abort()
 
     def _handle_route_with_http_cache(self, route: playwright.sync_api.Route):
         """原有的HTTP缓存路由处理"""
@@ -845,7 +1099,7 @@ document.addEventListener("visibilitychange", () => {
             logger.error(f"Error serving from cache: {e}")
             route.continue_()
 
-    def _fetch_and_cache_response(self, route: playwright.sync_api.Route, cache_key: str, max_retries: int = 2) -> bool:
+    def _fetch_and_cache_response(self, route: playwright.sync_api.Route, cache_key: str, max_retries: int = 0) -> bool:
         """获取响应并缓存，带重试机制"""
         for attempt in range(max_retries + 1):
             try:
