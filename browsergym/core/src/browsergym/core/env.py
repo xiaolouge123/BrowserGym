@@ -353,6 +353,7 @@ class BrowserEnv(gym.Env, ABC):
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36", # 示例UA
             # will raise an Exception if above args are overriden
+            storage_state=kwargs.get("storage_state", None),
             **self.pw_context_kwargs,
         )
 
