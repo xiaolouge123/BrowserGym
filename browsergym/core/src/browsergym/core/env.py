@@ -29,6 +29,7 @@ from .observation import (
     _pre_extract,
     extract_dom_extra_properties,
     extract_dom_snapshot,
+    extract_viewport_limited_axtree,
     extract_focused_element_bid,
     extract_merged_axtree,
     extract_screenshot,
@@ -86,6 +87,9 @@ class BrowserEnv(gym.Env, ABC):
         enable_context_cache: bool = False,
         context_cache_kwargs: dict = {},
         resource_filter_kwargs: dict = {},
+        # viewport-limited AXTree options
+        use_viewport_limited_axtree: bool = False,
+        viewport_limited_axtree_kwargs: dict = {},
     ):
         """
         Instantiate a ready to use BrowserEnv gym environment.
@@ -125,6 +129,8 @@ class BrowserEnv(gym.Env, ABC):
         self.enable_context_cache = enable_context_cache
         self.context_cache_kwargs = context_cache_kwargs
         self.resource_filter_kwargs = resource_filter_kwargs
+        self.use_viewport_limited_axtree = use_viewport_limited_axtree
+        self.viewport_limited_axtree_kwargs = viewport_limited_axtree_kwargs
 
         # check argument values
         assert tags_to_mark in ("all", "standard_html")
@@ -1271,7 +1277,10 @@ document.addEventListener("visibilitychange", () => {
                 _pre_extract(self.page, self.tags_to_mark)
 
                 dom = extract_dom_snapshot(self.page)
-                axtree = extract_merged_axtree(self.page)
+                if self.use_viewport_limited_axtree:
+                    axtree = extract_viewport_limited_axtree(self.page, **self.viewport_limited_axtree_kwargs)
+                else:
+                    axtree = extract_merged_axtree(self.page)
                 focused_element_bid = extract_focused_element_bid(self.page)
                 extra_properties = extract_dom_extra_properties(dom)
             except (playwright.sync_api.Error, MarkingError) as e:

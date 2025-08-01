@@ -522,6 +522,130 @@ def extract_merged_axtree(page: playwright.sync_api.Page):
     return merged_axtree
 
 
+def extract_viewport_limited_axtree(
+    page: playwright.sync_api.Page,
+    viewport_bounds: dict = None,
+    include_partially_visible: bool = True,
+    min_visibility_ratio: float = 0.1
+):
+    """
+    Extracts the merged AXTree of a Playwright page limited to a specific viewport area.
+    
+    Args:
+        page: the playwright page of which to extract the AXTree.
+        viewport_bounds: dict with keys 'x', 'y', 'width', 'height' defining the viewport area.
+                        If None, uses the current page viewport.
+        include_partially_visible: whether to include elements that are partially visible in the viewport.
+        min_visibility_ratio: minimum visibility ratio (0.0-1.0) for elements to be included.
+    
+    Returns:
+        A filtered merged AXTree containing only nodes within the specified viewport area.
+    """
+    # Get current viewport if not specified
+    if viewport_bounds is None:
+        viewport_info = page.evaluate("() => ({x: 0, y: 0, width: window.innerWidth, height: window.innerHeight})")
+        viewport_bounds = viewport_info
+    
+    # Extract the full merged AXTree first
+    full_axtree = extract_merged_axtree(page)
+    
+    # Get extra properties for visibility and bounding box information
+    dom_snapshot = extract_dom_snapshot(page)
+    extra_properties = extract_dom_extra_properties(dom_snapshot)
+    
+    # Filter nodes based on viewport bounds
+    filtered_nodes = []
+    node_id_mapping = {}  # Map old node IDs to new indices
+    
+    for i, node in enumerate(full_axtree["nodes"]):
+        bid = node.get("browsergym_id")
+        
+        # Always include nodes without bid (like root nodes, iframes)
+        if bid is None:
+            filtered_nodes.append(node)
+            node_id_mapping[node["nodeId"]] = len(filtered_nodes) - 1
+            continue
+        
+        # Check if node has extra properties
+        if bid in extra_properties:
+            node_props = extra_properties[bid]
+            bbox = node_props.get("bbox")
+            visibility = node_props.get("visibility", 0.0)
+            
+            # Skip if visibility is below threshold
+            if visibility < min_visibility_ratio:
+                continue
+            
+            # Check if element intersects with viewport
+            if bbox is not None:
+                x, y, width, height = bbox
+                element_bounds = {
+                    'x': x,
+                    'y': y, 
+                    'width': width,
+                    'height': height
+                }
+                
+                # Check intersection with viewport
+                if _rectangles_intersect(viewport_bounds, element_bounds):
+                    # If we only want fully visible elements, check if element is fully within viewport
+                    if not include_partially_visible:
+                        if not _rectangle_contains(viewport_bounds, element_bounds):
+                            continue
+                    
+                    filtered_nodes.append(node)
+                    node_id_mapping[node["nodeId"]] = len(filtered_nodes) - 1
+            else:
+                # If no bounding box, include the node (could be text nodes, etc.)
+                filtered_nodes.append(node)
+                node_id_mapping[node["nodeId"]] = len(filtered_nodes) - 1
+    
+    # Update child IDs to point to the new filtered indices
+    for node in filtered_nodes:
+        if "childIds" in node:
+            new_child_ids = []
+            for child_id in node["childIds"]:
+                if child_id in node_id_mapping:
+                    new_child_ids.append(node_id_mapping[child_id])
+            node["childIds"] = new_child_ids
+    
+    return {"nodes": filtered_nodes}
+
+
+def _rectangles_intersect(rect1: dict, rect2: dict) -> bool:
+    """
+    Check if two rectangles intersect.
+    
+    Args:
+        rect1: dict with 'x', 'y', 'width', 'height'
+        rect2: dict with 'x', 'y', 'width', 'height'
+    
+    Returns:
+        True if rectangles intersect, False otherwise
+    """
+    return not (rect1['x'] + rect1['width'] <= rect2['x'] or
+                rect2['x'] + rect2['width'] <= rect1['x'] or
+                rect1['y'] + rect1['height'] <= rect2['y'] or
+                rect2['y'] + rect2['height'] <= rect1['y'])
+
+
+def _rectangle_contains(outer: dict, inner: dict) -> bool:
+    """
+    Check if outer rectangle completely contains inner rectangle.
+    
+    Args:
+        outer: dict with 'x', 'y', 'width', 'height'
+        inner: dict with 'x', 'y', 'width', 'height'
+    
+    Returns:
+        True if outer contains inner, False otherwise
+    """
+    return (outer['x'] <= inner['x'] and
+            outer['y'] <= inner['y'] and
+            outer['x'] + outer['width'] >= inner['x'] + inner['width'] and
+            outer['y'] + outer['height'] >= inner['y'] + inner['height'])
+
+
 def extract_focused_element_bid(page: playwright.sync_api.Page):
     # this JS code will dive through ShadowDOMs
     extract_focused_element_with_bid_script = """\

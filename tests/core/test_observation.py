@@ -18,6 +18,7 @@ from browsergym.core.observation import (
     extract_dom_snapshot,
     extract_merged_axtree,
     extract_screenshot,
+    extract_viewport_limited_axtree,
 )
 from browsergym.utils.obs import flatten_axtree_to_str, flatten_dom_to_str
 
@@ -817,3 +818,40 @@ def test_tags_to_mark():
             tags_to_mark="fdsjkhjk",
             action_mapping=None,
         )
+
+
+def test_viewport_limited_axtree():
+    """Test the viewport-limited AXTree extraction functionality."""
+    env = gym.make(
+        "browsergym/openended",
+        task_kwargs={"start_url": TEST_PAGE_2},
+        headless=__HEADLESS,
+        slow_mo=__SLOW_MO,
+        timeout=__TIMEOUT,
+        action_mapping=None,
+    )
+    obs, info = env.reset()
+
+    _pre_extract(env.unwrapped.page)
+    
+    # Test with default viewport (should return all visible elements)
+    viewport_limited_axtree = extract_viewport_limited_axtree(env.unwrapped.page)
+    assert len(viewport_limited_axtree["nodes"]) > 0
+    
+    # Test with custom viewport bounds (top-left quarter of the page)
+    custom_viewport = {"x": 0, "y": 0, "width": 400, "height": 300}
+    limited_axtree = extract_viewport_limited_axtree(
+        env.unwrapped.page, 
+        viewport_bounds=custom_viewport
+    )
+    assert len(limited_axtree["nodes"]) <= len(viewport_limited_axtree["nodes"])
+    
+    # Test with higher visibility threshold
+    high_threshold_axtree = extract_viewport_limited_axtree(
+        env.unwrapped.page,
+        min_visibility_ratio=0.8
+    )
+    assert len(high_threshold_axtree["nodes"]) <= len(viewport_limited_axtree["nodes"])
+    
+    _post_extract(env.unwrapped.page)
+    env.close()
